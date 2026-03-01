@@ -160,7 +160,7 @@ def prepare_output_and_logger(args, experiment_name):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", experiment_name)
+        args.model_path = os.path.join("./results/", experiment_name)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))

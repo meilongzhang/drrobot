@@ -112,12 +112,11 @@ def render(viewpoint_camera,
 
     # [1, H, W, 3] -> [3, H, W]
     rendered_image = render_colors[0].permute(2, 0, 1)
-    radii = info["radii"].squeeze(0) # [N,]
+    radii = info["radii"].squeeze(0).max(dim=-1).values # [N,]
     try:
         info["means2d"].retain_grad() # [1, N, 2]
     except:
         pass
-
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.

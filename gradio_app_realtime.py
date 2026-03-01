@@ -1,8 +1,8 @@
 """
 How to use:
-1. Train a model using train.py, it will create a new directory in output/
+1. Train a model using train.py, it will create a new directory in results/
 2. Run this script
-python mujoco_app_realtime.py --model_path output/[path_to_your_model_directory]
+python gradio_app_realtime.py --model_path results/[path_to_your_model_directory]
 """
 
 
@@ -60,6 +60,8 @@ class DummyCam:
         self.distance = distance
         self.lookat = [0, 0, 0]  # Force lookat to be [0, 0, 0]
 
+
+## Given joint angles, render the robot with the Gaussian renderer
 def gaussian_render_scene(*joint_angles):
     azimuth, elevation, distance = 0, -45, 3  # Fixed camera parameters
     
@@ -72,10 +74,12 @@ def gaussian_render_scene(*joint_angles):
     frame = torch.clamp(render(example_camera_mujoco, gaussians, background_color)['render'], 0, 1)
     return frame.detach().cpu().numpy().transpose(1, 2, 0)
 
+## reset to canonical pose
 def reset_params():
     new_input_received.set()
     return [0.0] * n_joints
 
+# start the renderer on application start
 def initial_render():
     initial_params = reset_params()
     print("initial_params: ", initial_params, "rendering scene...")
@@ -87,6 +91,8 @@ def initial_render():
 
     return mujoco_image, gaussian_image
 
+
+# render the target scene in mujoco, aka the ground truth
 def render_scene(*args):
     os.environ['MUJOCO_GL'] = 'egl'
     
@@ -121,6 +127,8 @@ new_input_received = threading.Event()
 # Add a new global variable
 reset_to_mujoco = threading.Event()
 
+
+# job loop
 def continuous_optimization():
     print("Continuous optimization thread started")
     last_optimized_params = None
@@ -157,6 +165,7 @@ def continuous_optimization():
             print("Optimization queue is empty")
     print("Continuous optimization thread stopped")
 
+# match gaussian image to mujoco image
 def optimize(mujoco_params, gaussian_params, initial_lr=0.02, decay_factor=0.95, decay_steps=50):
     print("Starting optimization with params:", mujoco_params)
     
@@ -187,7 +196,9 @@ def optimize(mujoco_params, gaussian_params, initial_lr=0.02, decay_factor=0.95,
         optimizer.zero_grad()
 
         camera.joint_pose = joint_angles
-        gaussian_tensor = render(camera, gaussians, background_color)['render']
+        gaussian_tensor = render(camera, gaussians, background_color)['render'] # render the gaussian at camera viewpoint 
+
+        
 
         loss = F.mse_loss(mujoco_tensor, gaussian_tensor)
         loss.backward()
@@ -309,7 +320,12 @@ with gr.Blocks() as demo:
 
 if __name__ == "__main__":
     try:
-        demo.queue().launch(share=True, server_port=8080)
+        demo.queue().launch(
+            server_name="0.0.0.0",
+            share=True, 
+            server_port=8080,
+            inbrowser=False,
+        )
     finally:
         stop_optimization.set()
         optimization_thread.join()

@@ -3,9 +3,9 @@ import tempfile
 
 """
 How to use:
-1. Train a model using train.py, it will create a new directory in output/
+1. Train a model using train.py, it will create a new directory in results/
 2. Run this script
-python mujoco_app_reconstruct.py --model_path output/[path_to_your_model_directory]
+python gradio_app_reconstruct.py --model_path results/[path_to_your_model_directory]
 """
 
 

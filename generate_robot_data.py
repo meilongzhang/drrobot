@@ -258,7 +258,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_canonical_samples', type=int, default=500, help='Number of canonical samples.')
     parser.add_argument('--num_samples', type=int, default=10000, help='Number of samples.')
     parser.add_argument('--num_test', type=int, default=500, help='Number of test samples.')
-    parser.add_argument('--num_actors', type=int, default=20, help='Number of actors.')
+    parser.add_argument('--num_actors', type=int, default=10, help='Number of actors.')
     parser.add_argument('--camera_distance_factor', type=float, default=1.0, help='Factor to scale the camera distance, change this depending on robot size.')
     parser.add_argument('--debug', action='store_true', help='Debug mode.')
     parser.add_argument('--verbose', action='store_true', help='Verbose mode.')
