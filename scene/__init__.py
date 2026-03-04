@@ -80,6 +80,10 @@ class RobotScene:
             #load sample cameras from pkl file
             with open(os.path.join(self.model_path, "sample_cameras.pkl"), 'rb') as f:
                 self.sample_pose_conditioned_cameras = pickle.load(f)
+                # print(len(self.sample_pose_conditioned_cameras))
+                # print(self.sample_pose_conditioned_cameras[0].__dict__.keys())
+                # raise Exception("Stop")
+                
         else:
             print("[Scene] Loading datasets for training")
             #if you're not loading from a previous iteration, load the datasets for training

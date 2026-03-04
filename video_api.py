@@ -42,14 +42,18 @@ if __name__ == "__main__":
 
     #trajectory values are between [-1, 1] and they represent [-pi, pi] joint angles
     #joint_trajectory_begin = torch.tensor([-0.0, -0.0, -0.0, 0.0, 0.0, 0.0])
-    joint_trajectory_begin = torch.tensor([-0.0, 0.25, 0.25, 0.25, 0.25, 0.0])
-    joint_trajectory_end = torch.tensor([0.0, 0.75, 0.75, 0.75, 0.75, 0.0])
+    # joint_trajectory_begin = torch.tensor([-0.0, 0.25, 0.25, 0.25, 0.25, 0.0])
+    # joint_trajectory_end = torch.tensor([0.0, 0.75, 0.75, 0.75, 0.75, 0.0])
+
+
+    joint_trajectory_begin = torch.zeros((24,))
+    joint_trajectory_end = torch.ones((24,))
 
     #interpolate t=20
     T = 20
     joint_trajectory = torch.stack([joint_trajectory_begin + (joint_trajectory_end - joint_trajectory_begin) * t / T for t in range(T)])
 
-    gaussians, background_color, sample_cameras, kinematic_chain = initialize_gaussians(model_path='results/universal_robots_ur5e_experiment/', from_ckpt=True)
+    gaussians, background_color, sample_cameras, kinematic_chain = initialize_gaussians(model_path='results/shadow_hand/', from_ckpt=True)
 
     for i, camera in enumerate(sample_cameras):
         my_camera = camera
@@ -71,5 +75,5 @@ if __name__ == "__main__":
     video = (video * 255).astype(np.uint8)
 
     clip = ImageSequenceClip(list(video), fps=10)
-    clip.write_videofile("out_video_hard.mp4")
+    clip.write_videofile("out_video_shadow.mp4")
 

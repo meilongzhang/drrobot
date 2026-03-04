@@ -7,14 +7,22 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, OptimizationParams
 from gaussian_renderer import GaussianModel
-from scene.cameras import Camera
+from scene.cameras import Camera, Camera_Pose
 from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render
 from cotrack import sample_points_from_mask, make_cotracker_queries
 from transformers import Sam3Processor, Sam3Model
 from cotracker.utils.visualizer import Visualizer
+from utils.mujoco_utils import simulate_mujoco_scene, compute_camera_extrinsic_matrix
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+class DummyCam:
+    def __init__(self, azimuth=0, elevation=-45, distance=3):
+        self.azimuth = azimuth
+        self.elevation = elevation
+        self.distance = distance
+        self.lookat = [0, 0, 0]  # Force lookat to be [0, 0, 0]
 
 def make_open_uniform_knots(K: int, degree: int):
     """
@@ -198,13 +206,16 @@ def sinkhorn_trajectory_loss(
     return ot_loss, smooth, total
 
 
-def tracks_from_video_with_sam(video_frames_uint8, text="robot arm", n_points=32, seed=0):
+def tracks_from_video_with_sam(video_frames_uint8, text="robot arm", n_points=32, seed=0, indices=[0]):
     # video_frames_uint8: (T,H,W,3) uint8
     sam_model = Sam3Model.from_pretrained("facebook/sam3").to(device).eval()
     sam_proc = Sam3Processor.from_pretrained("facebook/sam3")
 
-    image0 = Image.fromarray(video_frames_uint8[0])
-    inputs = sam_proc(images=image0, text=text, return_tensors="pt").to(device)
+    images = [Image.fromarray(video_frames_uint8[i]) for i in indices]
+    texts = [text] * len(images)
+    #image0 = Image.fromarray(video_frames_uint8[0])
+    #inputs = sam_proc(images=image0, text=text, return_tensors="pt").to(device)
+    inputs = sam_proc(images=images, text=texts, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = sam_model(**inputs)
 
@@ -303,12 +314,13 @@ if __name__ == "__main__":
 
     #video_path = "./saved_videos/test_egodex_onehand.mp4"
     #video_path = "/nethome/chuang475/datasets/egodex/part2/insert_remove_furniture_bench_round_table/999.mp4"
-    video_path = "./999_small.mp4"
+    #video_path = "./999_small.mp4"
+    video_path = "./out_video.mp4"
     frames = iio.imread(video_path, plugin="pyav")  # plugin="pyav"
     Ts, Hs, Ws, _ = frames.shape
 
     # pick source queries via SAM3 (or just grid)
-    src_pts_xy = tracks_from_video_with_sam(frames, text="left hand", n_points=256, seed=0)
+    src_pts_xy = tracks_from_video_with_sam(frames, text="robot arm", n_points=256, seed=0)
     src_queries = make_cotracker_queries(src_pts_xy, device=device, t0=0)  # (1,N,3)
 
     source_video = torch.from_numpy(frames).to(device).permute(0,3,1,2).float().unsqueeze(0)  # (1,Ts,3,H,W)
@@ -328,69 +340,98 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     # setup differentiable renderer
-    gaussians, bg, cams, _ = initialize_gaussians(model_path="results/shadow_hand/", from_ckpt=True)
+    #gaussians, bg, cams, _ = initialize_gaussians(model_path="results/shadow_hand/", from_ckpt=True)
+    gaussians, bg, cams, _ = initialize_gaussians(model_path="results/universal_robots_ur5e_experiment/", from_ckpt=True)
     cam = next(iter(cams))
 
-    # Hs, Ws = frames.shape[1], frames.shape[2]
-    # # If your camera has known original render size (e.g., 480x480), compute scale from that:
-    # origH = getattr(cam, "image_height", getattr(cam, "H", None))
-    # origW = getattr(cam, "image_width",  getattr(cam, "W", None))
-    # # Set the new resolution
-    # set_camera_resolution(cam, Hs, Ws)
-    # # Scale intrinsics if present and if we know original size
-    # if origH is not None and origW is not None:
-    #     sx, sy = Ws / origW, Hs / origH
-    #     scale_camera_intrinsics(cam, sx, sy)
+    dummy_cam = DummyCam()
+    camera_extrinsic_matrix = compute_camera_extrinsic_matrix(dummy_cam)
+    learnable_cam = Camera_Pose(
+        torch.tensor(camera_extrinsic_matrix).clone().detach().float().cuda(),
+        cam.FoVx, cam.FoVy,
+        cam.image_width, cam.image_height,
+        joint_pose=None,          # or pass your joint tensor if Camera_Pose expects it
+        zero_init=True            # important: start from given pose then learn delta
+    ).cuda()
 
 
     T = Ts #min(20, Ts)          # match length
-    dof = 24
-    K = 10
+    dof = 6 #24
+    K = T//4
     #B = None
     B = bspline_basis_matrix(T=T, K=K, degree=3).to("cuda")  # [20, 10]
 
-    q_traj = torch.nn.Parameter(torch.zeros(K, dof, device="cuda"))
+    q_traj = torch.nn.Parameter(torch.ones(K, dof, device="cuda"))
     #q_traj = torch.nn.Parameter(torch.zeros(T, dof, device=device))
-    opt = torch.optim.Adam([q_traj], lr=2e-2)
+    # opt = torch.optim.Adam([q_traj], lr=2e-2)
+
+
+    # 1) Materialize and see how many params
+    # params = list(learnable_cam.parameters())
+    # print("num params:", len(params))
+    # for i, p in enumerate(params):
+    #     print(i, p, p.shape, p.dtype, p.device, "requires_grad=", p.requires_grad)
+
+
+
+    opt = torch.optim.Adam([
+        {"params": [q_traj], "lr": 2e-2},
+        {"params": learnable_cam.parameters(), "lr": 1e-2},
+    ])
     scaler = torch.cuda.amp.GradScaler(enabled=True)
+    # best_total = float("inf")
+    # best_iter = None
+    # best_q_traj = None
+    # best_cam_state = None
     for it in range(200):
         opt.zero_grad()
-
         with torch.cuda.amp.autocast(dtype=torch.float32):
             Q = spline_trajectory(B, q_traj)# if B else q_traj
-            
-            #robot_video = render_robot_video(cam, gaussians, bg, q_traj)  # (1,T,3,480,480)
-            # print("robot_video.requires_grad =", robot_video.requires_grad)
-            # print("robot_video grad_fn =", robot_video.grad_fn)
-
-            rendered_tracks, rendered_visibilities = render_tracks(cam, gaussians, bg, Q)
-            # print("rendered_tracks.requires_grad =", rendered_tracks.requires_grad)
-            # print("rendered_tracks grad_fn =", rendered_tracks.grad_fn)
-            # print("rendered_tracks shape =", rendered_tracks.shape)
-            
-            # IMPORTANT: no no_grad here; we want gradients through cotracker -> robot_video -> q_traj
-            # R_tracks, R_vis = cotracker(robot_video, queries=robot_queries)   # (1,T,N,2),(1,T,N,1)
-            # R_tracks = R_tracks[0]                 # (T,N,2)
-
-            # print("R_tracks.requires_grad =", R_tracks.requires_grad)
-            # print("R_tracks grad_fn =", R_tracks.grad_fn)
-
+            rendered_tracks, rendered_visibilities = render_tracks(learnable_cam, gaussians, bg, Q)
 
             # soft chamfer per timestep, optionally mask by visibility
             loss = 0.0
+            visis = 0.0
+            tots = 0.0
+
+            init_g_vis = (G_vis[0] > 0.5)
+            init_p_vis = (rendered_visibilities[0] > 0.5)
             for t in range(T):
-                # optionally keep only visible source points
-                vis = (G_vis[t] > 0.5)
-                S_t = G_tracks[t][vis]
+                cur_g_vis = (G_vis[t] > 0.5)
+                cur_p_vis = (rendered_visibilities[t] > 0.5)
+               
+                init_S_t = G_tracks[t][init_g_vis]
+                init_P_t = rendered_tracks[t][init_p_vis]
+
+                cur_S_t = G_tracks[t][cur_g_vis]
+                cur_P_t = rendered_tracks[t][cur_p_vis]
                 
-                p_vis = (rendered_visibilities[t] > 0.5)
-                P_t = rendered_tracks[t][p_vis]
-                loss = loss + soft_chamfer(P_t, S_t, tau=300.0)
+                # tots += len(rendered_visibilities[0])
+                # visis += sum(p_vis)
+                l = ((soft_chamfer(init_S_t, init_P_t, tau=300.0)/sum(init_p_vis)) + (soft_chamfer(cur_S_t, cur_P_t, tau=300.0)/sum(cur_p_vis)))/2
+                loss = loss + l
+
 
             loss = loss / T
             smooth = ((q_traj[1:] - q_traj[:-1])**2).mean()
             total = loss + 0.1 * smooth
+            # print(f"there are {visis/T} visible gaussians")
+            # print(f"there are {tots/T} total gaussians")
             #loss, smooth, total = sinkhorn_trajectory_loss(G_vis, G_tracks, rendered_visibilities, rendered_tracks, q_traj, T)
+
+        # if not torch.isfinite(total):
+        #     print(f"Skipping iteration {it} because total loss is non-finite: {float(total.detach())}")
+        #     continue
+
+        # total_value = float(total.detach())
+        # if total_value < best_total:
+        #     best_total = total_value
+        #     best_iter = it
+        #     best_q_traj = q_traj.detach().clone()
+        #     best_cam_state = {
+        #         name: param.detach().clone()
+        #         for name, param in learnable_cam.state_dict().items()
+        #     }
 
         scaler.scale(total).backward()
         scaler.step(opt)
@@ -401,12 +442,20 @@ if __name__ == "__main__":
         if it % 10 == 0:
             print(it, float(total), float(loss), float(smooth))
 
+    # if best_q_traj is not None and best_cam_state is not None:
+    #     with torch.no_grad():
+    #         q_traj.copy_(best_q_traj)
+    #     learnable_cam.load_state_dict(best_cam_state)
+    #     print(f"Restored best parameters from iteration {best_iter} with total loss {best_total}")
+    # else:
+    #     print("No finite loss was found; rendering with the latest parameters.")
+
     with torch.no_grad():
         Q = spline_trajectory(B, q_traj)# if B else q_traj   # (T,dof)
 
     with torch.inference_mode():
-        video = render_robot_video(cam, gaussians, bg, Q)
-        pred_tracks, pred_visibility = render_tracks(cam, gaussians, bg, Q)
+        video = render_robot_video(learnable_cam, gaussians, bg, Q)
+        pred_tracks, pred_visibility = render_tracks(learnable_cam, gaussians, bg, Q)
 
     pred_tracks = pred_tracks.unsqueeze(0) # (1, T, N, 2)
     pred_visibility = pred_visibility.unsqueeze(0).unsqueeze(-1) # (1, T, N, 1)
@@ -418,7 +467,8 @@ if __name__ == "__main__":
 
     clip = ImageSequenceClip(list(video), fps=10)
 
-    test_name = "rendered_egodex_noinit_bspline_chamfer_downsampled"
+    test_name = "rendered_noinit_bspline_chamfer_ur5e"
+    #test_name = "rendered_shadow_noinit_bspline_chamfer_optcamera"
     clip.write_videofile(test_name + ".mp4") 
 
     frames = iio.imread(test_name + ".mp4", plugin="FFMPEG")  # plugin="pyav"
