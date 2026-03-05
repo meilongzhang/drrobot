@@ -1,7 +1,9 @@
 import torch
+import numpy as np
 from scene import Scene, RobotScene
 from tqdm import tqdm
 from os import makedirs
+from PIL import Image
 from gaussian_renderer import render
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
@@ -208,6 +210,19 @@ def sinkhorn_trajectory_loss(
 
 def tracks_from_video_with_sam(video_frames_uint8, text="robot arm", n_points=32, seed=0, indices=[0]):
     # video_frames_uint8: (T,H,W,3) uint8
+    if isinstance(indices, set):
+        indices = sorted(indices)
+    else:
+        indices = list(indices)
+
+    if not indices:
+        return {}
+
+    num_frames = len(video_frames_uint8)
+    for idx in indices:
+        if idx < 0 or idx >= num_frames:
+            raise IndexError(f"Frame index {idx} is out of bounds for {num_frames} frames.")
+
     sam_model = Sam3Model.from_pretrained("facebook/sam3").to(device).eval()
     sam_proc = Sam3Processor.from_pretrained("facebook/sam3")
 
@@ -224,28 +239,52 @@ def tracks_from_video_with_sam(video_frames_uint8, text="robot arm", n_points=32
         threshold=0.5,
         mask_threshold=0.5,
         target_sizes=inputs["original_sizes"].tolist()
-    )[0]
+    )
 
-    masks = results["masks"]
+    points_by_index = {}
+    for frame_idx, result in zip(indices, results):
+        masks = result["masks"]
 
-    # normalize to torch tensor (N,H,W)
-    if isinstance(masks, (list, tuple)):
-        masks = torch.stack([m if isinstance(m, torch.Tensor) else torch.from_numpy(m) for m in masks], dim=0)
-    if isinstance(masks, torch.Tensor):
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks = masks[:, 0]
-        elif masks.ndim == 2:
-            masks = masks[None, ...]
-        mask0 = masks.any(dim=0).cpu().numpy()
-    else:
-        mask0 = np.any(np.asarray(masks), axis=0)
+        # Normalize HF output variants to a single (H,W) boolean mask per frame.
+        if isinstance(masks, (list, tuple)):
+            if len(masks) == 0:
+                combined_mask = None
+            else:
+                masks = torch.stack(
+                    [m if isinstance(m, torch.Tensor) else torch.from_numpy(m) for m in masks],
+                    dim=0,
+                )
 
-    pts_xy = sample_points_from_mask(mask0, n=n_points, seed=seed)  # (N,2) (x,y)
+        if isinstance(masks, torch.Tensor):
+            if masks.ndim == 4 and masks.shape[1] == 1:
+                masks = masks[:, 0]
+            elif masks.ndim == 2:
+                masks = masks[None, ...]
+            combined_mask = masks.any(dim=0).cpu().numpy()
+        elif masks is None:
+            combined_mask = None
+        else:
+            masks = np.asarray(masks)
+            combined_mask = None if masks.size == 0 else np.any(masks, axis=0)
+
+        if combined_mask is None or not np.any(combined_mask):
+            points_by_index[frame_idx] = np.zeros((0, 2), dtype=np.float32)
+            continue
+
+        points_by_index[frame_idx] = sample_points_from_mask(
+            combined_mask,
+            n=n_points,
+            seed=seed + frame_idx,
+        )
 
     # FREE VRAM
     del outputs, inputs, sam_model
-    torch.cuda.empty_cache()
-    return pts_xy 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if len(indices) == 1:
+        return points_by_index[indices[0]]
+    return points_by_index
 
 def spline_trajectory(B, C_raw):
     Q = B @ C_raw  # [T, D]
@@ -319,9 +358,27 @@ if __name__ == "__main__":
     frames = iio.imread(video_path, plugin="pyav")  # plugin="pyav"
     Ts, Hs, Ws, _ = frames.shape
 
-    # pick source queries via SAM3 (or just grid)
-    src_pts_xy = tracks_from_video_with_sam(frames, text="robot arm", n_points=256, seed=0)
-    src_queries = make_cotracker_queries(src_pts_xy, device=device, t0=0)  # (1,N,3)
+    # Pick source queries via SAM3 on the first, middle, and last frames.
+    query_indices = sorted({0, Ts // 2, Ts - 1})
+    src_pts_by_idx = tracks_from_video_with_sam(
+        frames,
+        text="robot arm",
+        n_points=256,
+        seed=0,
+        indices=query_indices,
+    )
+
+    query_chunks = []
+    for t in query_indices:
+        pts_xy = src_pts_by_idx[t]
+        if pts_xy.shape[0] == 0:
+            continue
+        query_chunks.append(make_cotracker_queries(pts_xy, device=device, t0=t))
+
+    if not query_chunks:
+        raise ValueError("SAM3 did not produce any valid masks on the selected query frames.")
+
+    src_queries = torch.cat(query_chunks, dim=1)  # (1,N_total,3)
 
     source_video = torch.from_numpy(frames).to(device).permute(0,3,1,2).float().unsqueeze(0)  # (1,Ts,3,H,W)
 
@@ -330,7 +387,11 @@ if __name__ == "__main__":
         p.requires_grad_(False)
 
     with torch.no_grad():
-        G_tracks, G_vis = cotracker(source_video, queries=src_queries)  # (1,Ts,N,2), (1,Ts,N,1)
+        G_tracks, G_vis = cotracker(
+            source_video,
+            queries=src_queries,
+            backward_tracking=True,
+        )  # (1,Ts,N,2), (1,Ts,N,1)
     G_tracks = G_tracks[0]                # (Ts,N,2) (21, 64, 2)
     G_vis = G_vis[0,:,:]                # (Ts,N)
     #print("ground truth tracks shape=", G_tracks.shape)
@@ -365,15 +426,6 @@ if __name__ == "__main__":
     #q_traj = torch.nn.Parameter(torch.zeros(T, dof, device=device))
     # opt = torch.optim.Adam([q_traj], lr=2e-2)
 
-
-    # 1) Materialize and see how many params
-    # params = list(learnable_cam.parameters())
-    # print("num params:", len(params))
-    # for i, p in enumerate(params):
-    #     print(i, p, p.shape, p.dtype, p.device, "requires_grad=", p.requires_grad)
-
-
-
     opt = torch.optim.Adam([
         {"params": [q_traj], "lr": 2e-2},
         {"params": learnable_cam.parameters(), "lr": 1e-2},
@@ -391,24 +443,25 @@ if __name__ == "__main__":
 
             # soft chamfer per timestep, optionally mask by visibility
             loss = 0.0
-            visis = 0.0
-            tots = 0.0
+            # visis = 0.0
+            # tots = 0.0
 
-            init_g_vis = (G_vis[0] > 0.5)
-            init_p_vis = (rendered_visibilities[0] > 0.5)
+            # init_g_vis = (G_vis[0] > 0.5)
+            # init_p_vis = (rendered_visibilities[0] > 0.5)
             for t in range(T):
-                cur_g_vis = (G_vis[t] > 0.5)
-                cur_p_vis = (rendered_visibilities[t] > 0.5)
+                l = soft_chamfer(G_tracks[t], rendered_tracks[t]) / len(rendered_tracks[t])
+                # cur_g_vis = (G_vis[t] > 0.5)
+                # cur_p_vis = (rendered_visibilities[t] > 0.5)
                
-                init_S_t = G_tracks[t][init_g_vis]
-                init_P_t = rendered_tracks[t][init_p_vis]
+                # init_S_t = G_tracks[t][init_g_vis]
+                # init_P_t = rendered_tracks[t][init_p_vis]
 
-                cur_S_t = G_tracks[t][cur_g_vis]
-                cur_P_t = rendered_tracks[t][cur_p_vis]
+                # cur_S_t = G_tracks[t][cur_g_vis]
+                # cur_P_t = rendered_tracks[t][cur_p_vis]
                 
-                # tots += len(rendered_visibilities[0])
-                # visis += sum(p_vis)
-                l = ((soft_chamfer(init_S_t, init_P_t, tau=300.0)/sum(init_p_vis)) + (soft_chamfer(cur_S_t, cur_P_t, tau=300.0)/sum(cur_p_vis)))/2
+                # # tots += len(rendered_visibilities[0])
+                # # visis += sum(p_vis)
+                # l = ((soft_chamfer(init_S_t, init_P_t, tau=300.0)/sum(init_p_vis)) + (soft_chamfer(cur_S_t, cur_P_t, tau=300.0)/sum(cur_p_vis)))/2
                 loss = loss + l
 
 
