@@ -124,3 +124,94 @@ def render(viewpoint_camera,
             "viewspace_points": info["means2d"],
             "visibility_filter" : radii > 0,
             "radii": radii}
+
+
+def render_3d(viewpoint_camera,
+              pc: GaussianModel,
+              scaling_modifier=1.0,
+              stage='pose_conditioned'):
+    """
+    Return the deformed 3-D Gaussian means without rasterization.
+
+    Outputs match the render() dict schema so call-sites can be swapped trivially:
+      - "viewspace_points" : [1, N, 3]  – world-space XYZ of each Gaussian mean
+      - "visibility_filter": [N]  bool  – True for Gaussians in front of & inside the camera frustum
+      - "radii"            : [N]  float – approximate screen-space extent (pixels); 0 for culled
+    """
+    assert stage in ['canonical', 'pose_conditioned']
+
+    means3D    = pc.get_xyz
+    opacity    = pc.get_opacity
+    scales     = pc.get_scaling * scaling_modifier
+    rotations  = pc.get_rotation
+    shs        = pc.get_features
+
+    joints = viewpoint_camera.joint_pose.to(means3D.device).repeat(means3D.shape[0], 1)
+
+    if stage == 'pose_conditioned':
+        if pc.args.k_plane:
+            means3D, scales, rotations, opacity, shs = pc._deformation(
+                means3D, scales, rotations, opacity, shs, times_sel=None, joints=joints)
+            rotations = pc.rotation_activation(rotations)
+        else:
+            means3D_deformed, rotations_deformed = lrs(
+                joints[0][None].float(), means3D[None], pc._lrs, pc.chain,
+                pose_normalized=True, lrs_model=pc.lrs_model, rotations=rotations)
+
+            if pc.args.no_appearance_deformation:
+                pass  # means3D_deformed already computed
+            else:
+                scales_out, _rotations_out, opacity_out, shs_out = \
+                    pose_conditioned_deform(
+                        means3D[None], means3D_deformed[None],
+                        scales[None], rotations[None],
+                        opacity[None], shs[None],
+                        joints[None].float(), pc.appearance_deformation_model)
+                scales  = scales_out[0]
+                opacity = opacity_out[0]
+                shs     = shs_out[0]
+
+            means3D   = means3D_deformed[0]
+            rotations = rotations_deformed[0]
+
+    # ── Frustum culling without rasterization ──────────────────────────────
+    # Project means into camera (view) space to test depth and image bounds.
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(means3D.device)  # [4,4] c2w^-1
+
+    N = means3D.shape[0]
+    ones = torch.ones(N, 1, device=means3D.device, dtype=means3D.dtype)
+    means3D_h = torch.cat([means3D, ones], dim=1)   # [N, 4]
+    p_cam = (viewmat @ means3D_h.T).T               # [N, 4]  (camera space)
+    z_cam = p_cam[:, 2]                             # [N]
+
+    # Build intrinsics from camera FoV (same as render())
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    focal_x = viewpoint_camera.image_width  / (2 * tanfovx)
+    focal_y = viewpoint_camera.image_height / (2 * tanfovy)
+    cx_px   = viewpoint_camera.image_width  / 2.0
+    cy_px   = viewpoint_camera.image_height / 2.0
+    W       = int(viewpoint_camera.image_width)
+    H       = int(viewpoint_camera.image_height)
+
+    # Project to 2D
+    u = focal_x * (p_cam[:, 0] / z_cam.clamp(min=1e-8)) + cx_px  # [N]
+    v = focal_y * (p_cam[:, 1] / z_cam.clamp(min=1e-8)) + cy_px  # [N]
+
+    in_front  = z_cam > 0
+    in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    visibility_filter = in_front & in_bounds         # [N]  bool
+
+    # Approximate screen-space radius from the largest scale axis projected to pixels
+    scale_max = scales.max(dim=-1).values            # [N]
+    radii = torch.zeros(N, device=means3D.device, dtype=means3D.dtype)
+    vis_idx = visibility_filter.nonzero(as_tuple=True)[0]
+    if vis_idx.numel() > 0:
+        z_vis    = z_cam[vis_idx].clamp(min=1e-8)
+        radii[vis_idx] = (focal_x * scale_max[vis_idx] / z_vis).clamp(min=0)
+
+    return {
+        "viewspace_points"  : means3D.unsqueeze(0),   # [1, N, 3]
+        "visibility_filter" : visibility_filter,       # [N]
+        "radii"             : radii,                   # [N]
+    }
