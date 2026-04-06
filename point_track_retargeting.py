@@ -353,8 +353,8 @@ if __name__ == "__main__":
 
     #video_path = "./saved_videos/test_egodex_onehand.mp4"
     #video_path = "/nethome/chuang475/datasets/egodex/part2/insert_remove_furniture_bench_round_table/999.mp4"
-    #video_path = "./999_small.mp4"
-    video_path = "./out_video.mp4"
+    video_path = "./999.mp4"
+    #video_path = "./out_video.mp4"
     frames = iio.imread(video_path, plugin="pyav")  # plugin="pyav"
     Ts, Hs, Ws, _ = frames.shape
 
@@ -362,7 +362,7 @@ if __name__ == "__main__":
     query_indices = sorted({0, Ts // 2, Ts - 1})
     src_pts_by_idx = tracks_from_video_with_sam(
         frames,
-        text="robot arm",
+        text="left hand",
         n_points=256,
         seed=0,
         indices=query_indices,
@@ -401,8 +401,8 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     # setup differentiable renderer
-    #gaussians, bg, cams, _ = initialize_gaussians(model_path="results/shadow_hand/", from_ckpt=True)
-    gaussians, bg, cams, _ = initialize_gaussians(model_path="results/universal_robots_ur5e_experiment/", from_ckpt=True)
+    gaussians, bg, cams, _ = initialize_gaussians(model_path="results/shadow_hand/", from_ckpt=True)
+    #gaussians, bg, cams, _ = initialize_gaussians(model_path="results/universal_robots_ur5e_experiment/", from_ckpt=True)
     cam = next(iter(cams))
 
     dummy_cam = DummyCam()
@@ -417,7 +417,7 @@ if __name__ == "__main__":
 
 
     T = Ts #min(20, Ts)          # match length
-    dof = 6 #24
+    dof = 24 #6 #24
     K = T//4
     #B = None
     B = bspline_basis_matrix(T=T, K=K, degree=3).to("cuda")  # [20, 10]
@@ -520,8 +520,8 @@ if __name__ == "__main__":
 
     clip = ImageSequenceClip(list(video), fps=10)
 
-    test_name = "rendered_noinit_bspline_chamfer_ur5e"
-    #test_name = "rendered_shadow_noinit_bspline_chamfer_optcamera"
+    #test_name = "rendered_noinit_bspline_chamfer_ur5e"
+    test_name = "rendered_shadow_noinit_bspline_chamfer_optcamera"
     clip.write_videofile(test_name + ".mp4") 
 
     frames = iio.imread(test_name + ".mp4", plugin="FFMPEG")  # plugin="pyav"

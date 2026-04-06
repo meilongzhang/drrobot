@@ -19,7 +19,7 @@ class Camera_Pose(nn.Module):
              zero_init=False):
         super(Camera_Pose, self).__init__()
 
-        self.FoVx = FoVx
+        self.FoVx = FoVx # field of view
         self.FoVy = FoVy
 
         self.image_width = image_width
@@ -37,7 +37,7 @@ class Camera_Pose(nn.Module):
         self.w = nn.Parameter(torch.normal(0., 1e-6, size=(3,)).to(start_pose_w2c.device))
         self.v = nn.Parameter(torch.normal(0., 1e-6, size=(3,)).to(start_pose_w2c.device))
         self.device = start_pose_w2c.device
-        self.start_pose_w2c = start_pose_w2c
+        self.start_pose_w2c = start_pose_w2c # robot2cam
         
         # deltaT=se3_to_SE3(self.w,self.v).to(start_pose_w2c.device)
         # self.pose_w2c = torch.matmul(deltaT, start_pose_w2c.detach().inverse()).inverse()

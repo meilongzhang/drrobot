@@ -89,7 +89,12 @@ def render(viewpoint_camera,
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # breakpoint()
+
+    # this updates the camera pose if it is learnable, so the viewmat used for rasterization is the updated one.
+    # this is still in world2cam
     viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(means3D.device)
+
+
     # viewmat = viewmat.requires_grad_(True)
     # print("viewmat shape", viewmat.shape, "supposed to be 4x4")
     # print("grad before", viewpoint_camera.v.grad)
